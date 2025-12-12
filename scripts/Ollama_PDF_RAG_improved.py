@@ -13,6 +13,7 @@ import os
 import hashlib
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Optional, List, Dict
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -258,10 +259,10 @@ class PDFRAGSystem:
     ) -> List[Document]:
         """문서 검색"""
         try:
-            # 검색 타입 설정 (similarity 또는 mmr)
+            # ChromaDB retriever는 score_threshold를 직접 지원하지 않음
+            # k 값만 설정
             search_kwargs = {
-                'k': k,
-                'score_threshold': score_threshold
+                'k': k
             }
             retriever.search_kwargs = search_kwargs
             
@@ -274,10 +275,13 @@ class PDFRAGSystem:
         """문서 포맷팅"""
         if not docs:
             return ""
-        return "\n\n".join([
-            f"[문서 {i+1}]\n{doc.page_content}" 
-            for i, doc in enumerate(docs)
-        ])
+        formatted = []
+        for i, doc in enumerate(docs):
+            source_info = ""
+            if 'source_file' in doc.metadata:
+                source_info = f" (출처: {doc.metadata['source_file']})"
+            formatted.append(f"[문서 {i+1}]{source_info}\n{doc.page_content}")
+        return "\n\n".join(formatted)
     
     def generate_answer(
         self,
@@ -310,6 +314,111 @@ class PDFRAGSystem:
         except Exception as e:
             raise Exception(f"답변 생성 실패: {str(e)}")
     
+    def load_multiple_pdfs(
+        self,
+        file_paths: List[str],
+        use_cache: bool = True
+    ) -> tuple:
+        """
+        여러 PDF를 로드하고 통합 벡터 저장소 생성
+        Returns: (retriever, info_dict)
+        """
+        start_time = time.time()
+        all_splits = []
+        load_infos = []
+        total_chunks = 0
+        
+        try:
+            # 임시 통합 벡터 저장소 경로
+            temp_cache_path = self.cache_manager.cache_dir / f"temp_combined_{uuid.uuid4().hex[:8]}"
+            
+            for file_path in file_paths:
+                file_start = time.time()
+                
+                # 파일 존재 확인
+                if not os.path.exists(file_path):
+                    print(f"⚠️ 파일을 찾을 수 없습니다: {file_path}")
+                    continue
+                
+                # 캐시 확인
+                if use_cache and self.cache_manager.is_cached(file_path):
+                    print(f"✅ 캐시에서 로드: {os.path.basename(file_path)}")
+                    cached_info = self.cache_manager.get_cached_info(file_path)
+                    file_hash = self.cache_manager.get_file_hash(file_path)
+                    cache_path = self.cache_manager.get_cache_path(file_hash)
+                    
+                    # 기존 벡터 저장소에서 문서 가져오기
+                    cached_vectorstore = Chroma(
+                        persist_directory=str(cache_path),
+                        embedding_function=self.embeddings
+                    )
+                    # 벡터 저장소에서 모든 문서 가져오기
+                    # Chroma에서 직접 문서를 가져오는 방법이 제한적이므로
+                    # 재처리하는 것이 더 안전합니다
+                    use_cache_for_this = False
+                else:
+                    use_cache_for_this = False
+                
+                if not use_cache_for_this:
+                    # 새로 처리
+                    print(f"📄 PDF 처리 중: {os.path.basename(file_path)}")
+                    loader = PyMuPDFLoader(file_path)
+                    docs = loader.load()
+                    
+                    if not docs:
+                        print(f"⚠️ PDF에서 텍스트를 추출할 수 없습니다: {file_path}")
+                        continue
+                    
+                    print(f"✅ {len(docs)} 페이지 로드 완료")
+                    
+                    # 텍스트 분할
+                    splits = self.text_splitter.split_documents(docs)
+                    print(f"✅ {len(splits)}개 청크로 분할 완료")
+                    
+                    # 각 문서에 출처 정보 추가
+                    file_name = os.path.basename(file_path)
+                    for split in splits:
+                        split.metadata['source_file'] = file_name
+                        split.metadata['source_path'] = file_path
+                    
+                    all_splits.extend(splits)
+                    total_chunks += len(splits)
+                    
+                    load_time = time.time() - file_start
+                    load_infos.append({
+                        'file_name': file_name,
+                        'cached': False,
+                        'load_time': load_time,
+                        'chunk_count': len(splits)
+                    })
+            
+            if not all_splits:
+                raise ValueError("처리할 수 있는 PDF 파일이 없습니다.")
+            
+            # 통합 벡터 저장소 생성
+            print(f"📚 총 {len(all_splits)}개 청크를 통합 벡터 저장소에 추가 중...")
+            vectorstore = Chroma.from_documents(
+                documents=all_splits,
+                embedding=self.embeddings,
+                persist_directory=str(temp_cache_path)
+            )
+            vectorstore.persist()
+            
+            retriever = vectorstore.as_retriever()
+            total_load_time = time.time() - start_time
+            
+            info = {
+                'file_count': len(file_paths),
+                'total_chunks': total_chunks,
+                'load_time': total_load_time,
+                'files': load_infos
+            }
+            
+            return retriever, info
+            
+        except Exception as e:
+            raise Exception(f"여러 PDF 로드 실패: {str(e)}")
+    
     def process_query(
         self,
         file_path: str,
@@ -318,7 +427,7 @@ class PDFRAGSystem:
         score_threshold: float = Config.DEFAULT_SEARCH_SCORE_THRESHOLD,
         use_cache: bool = True
     ) -> Dict:
-        """전체 RAG 파이프라인 실행"""
+        """전체 RAG 파이프라인 실행 (단일 파일)"""
         start_time = time.time()
         result = {
             'answer': '',
@@ -372,6 +481,69 @@ class PDFRAGSystem:
             result['error'] = str(e)
             result['answer'] = f"❌ 오류 발생: {str(e)}"
             return result
+    
+    def process_query_multiple(
+        self,
+        file_paths: List[str],
+        question: str,
+        k: int = Config.DEFAULT_SEARCH_K,
+        score_threshold: float = Config.DEFAULT_SEARCH_SCORE_THRESHOLD,
+        use_cache: bool = True
+    ) -> Dict:
+        """전체 RAG 파이프라인 실행 (여러 파일)"""
+        start_time = time.time()
+        result = {
+            'answer': '',
+            'error': None,
+            'info': {}
+        }
+        
+        try:
+            # 여러 PDF 로드 및 통합
+            retriever, load_info = self.load_multiple_pdfs(file_paths, use_cache)
+            result['info']['load'] = load_info
+            
+            # 문서 검색
+            search_start = time.time()
+            retrieved_docs = self.search_documents(
+                retriever, question, k, score_threshold
+            )
+            search_time = time.time() - search_start
+            
+            if not retrieved_docs:
+                result['answer'] = "관련 문서를 찾을 수 없습니다. 질문을 더 구체적으로 작성해 보세요."
+                result['info']['search'] = {
+                    'time': search_time,
+                    'doc_count': 0
+                }
+                return result
+            
+            # 컨텍스트 구성
+            context = self.format_docs(retrieved_docs)
+            
+            # 답변 생성
+            gen_start = time.time()
+            answer = self.generate_answer(question, context)
+            gen_time = time.time() - gen_start
+            
+            total_time = time.time() - start_time
+            
+            result['answer'] = answer
+            result['info']['search'] = {
+                'time': search_time,
+                'doc_count': len(retrieved_docs)
+            }
+            result['info']['generation'] = {
+                'time': gen_time
+            }
+            result['info']['total_time'] = total_time
+            
+            return result
+            
+        except Exception as e:
+            result['error'] = str(e)
+            result['answer'] = f"❌ 오류 발생: {str(e)}"
+            return result
 
 
 # Gradio 인터페이스
@@ -382,15 +554,15 @@ def create_interface():
     rag_system = PDFRAGSystem()
     
     def process_rag(
-        file,
+        files,
         question: str,
         llm_model: str,
         embedding_model: str,
         search_k: int,
         use_cache: bool
     ) -> str:
-        """RAG 처리 함수"""
-        if not file:
+        """RAG 처리 함수 (여러 파일 지원)"""
+        if not files:
             return "❌ PDF 파일을 업로드해주세요."
         
         if not question or not question.strip():
@@ -404,13 +576,30 @@ def create_interface():
                 rag_system.embedding_model = embedding_model
                 rag_system.embeddings = OllamaEmbeddings(model=embedding_model)
             
+            # 파일 경로 리스트 생성
+            if isinstance(files, (list, tuple)):
+                file_paths = [f.name for f in files]
+            else:
+                # 단일 파일인 경우
+                file_paths = [files.name]
+            
             # RAG 처리
-            result = rag_system.process_query(
-                file_path=file.name,
-                question=question,
-                k=search_k,
-                use_cache=use_cache
-            )
+            if len(file_paths) == 1:
+                # 단일 파일 처리
+                result = rag_system.process_query(
+                    file_path=file_paths[0],
+                    question=question,
+                    k=search_k,
+                    use_cache=use_cache
+                )
+            else:
+                # 여러 파일 처리
+                result = rag_system.process_query_multiple(
+                    file_paths=file_paths,
+                    question=question,
+                    k=search_k,
+                    use_cache=use_cache
+                )
             
             if result['error']:
                 return result['answer']
@@ -423,10 +612,24 @@ def create_interface():
             info_text = "\n\n---\n📊 처리 정보:\n"
             if 'load' in info:
                 load_info = info['load']
-                cache_status = "✅ 캐시 사용" if load_info.get('cached') else "🔄 새로 처리"
-                info_text += f"- {cache_status}\n"
-                info_text += f"- 로드 시간: {load_info.get('load_time', 0):.2f}초\n"
-                info_text += f"- 청크 수: {load_info.get('chunk_count', 0)}개\n"
+                
+                # 여러 파일인 경우
+                if 'file_count' in load_info:
+                    info_text += f"- 업로드된 파일 수: {load_info.get('file_count', 0)}개\n"
+                    info_text += f"- 총 청크 수: {load_info.get('total_chunks', 0)}개\n"
+                    info_text += f"- 로드 시간: {load_info.get('load_time', 0):.2f}초\n"
+                    if 'files' in load_info:
+                        info_text += "\n📄 파일별 정보:\n"
+                        for file_info in load_info['files']:
+                            info_text += f"  • {file_info.get('file_name', 'Unknown')}: "
+                            info_text += f"{file_info.get('chunk_count', 0)}개 청크 "
+                            info_text += f"({file_info.get('load_time', 0):.2f}초)\n"
+                else:
+                    # 단일 파일인 경우
+                    cache_status = "✅ 캐시 사용" if load_info.get('cached') else "🔄 새로 처리"
+                    info_text += f"- {cache_status}\n"
+                    info_text += f"- 로드 시간: {load_info.get('load_time', 0):.2f}초\n"
+                    info_text += f"- 청크 수: {load_info.get('chunk_count', 0)}개\n"
             
             if 'search' in info:
                 search_info = info['search']
@@ -484,9 +687,10 @@ def create_interface():
         with gr.Row():
             with gr.Column(scale=2):
                 file_input = gr.File(
-                    label="📄 PDF 파일 업로드",
+                    label="📄 PDF 파일 업로드 (여러 개 선택 가능)",
                     type="filepath",
-                    file_types=[".pdf"]
+                    file_types=[".pdf"],
+                    file_count="multiple"
                 )
                 
                 question_input = gr.Textbox(
